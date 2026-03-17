@@ -52,6 +52,10 @@ stdenv.mkDerivation {
     # Backport of upstream 2d7ed98a (Trofi, BZ#29564): GNU Make 4.4+
     # exposes long options in MAKEFLAGS which breaks glibc's Makerules.
     ./fix-makeflags-for-make-4.4.patch
+    # Make the dynamic linker treat missing version nodes (e.g.
+    # GLIBC_2.34 required by GCC 15's libgcc_s.so) as non-fatal.
+    # The actual symbols are provided by libglibc_compat.so.
+    ./skip-version-not-found.patch
   ];
 
   outputs = [
@@ -217,15 +221,52 @@ stdenv.mkDerivation {
     sed "/^GROUP/s|$out/lib/lib|$static/lib/lib|g" \
       -i "$static"/lib/*.a
 
-    # Provide forward-compat shims for glibc symbols that don't exist in
-    # 2.27 but are referenced by packages built with modern toolchains.
-    # Added after the .a relocation so we modify the final libc_nonshared.a.
+    # Forward-compat shims for symbols that GCC 15's runtime libraries
+    # (libgcc_s.so, libstdc++.so) need but glibc 2.27 lacks.
+    # Built as a shared library with its own version script so the
+    # versioned symbols are self-contained (no GLIBC_2.34 requirement
+    # on libc.so).  Using dlsym() to call the glibc 2.27 implementations
+    # avoids creating a versioned dependency on libpthread.
     cat > /tmp/glibc_compat.c <<'COMPAT'
+    /* Avoid including any glibc headers that might conflict; use
+       bare declarations and dlsym from the dynamic linker. */
+    extern void *dlsym(void *handle, const char *symbol);
+    #define RTLD_NEXT ((void *) -1L)
+
     /* __libc_single_threaded: added in glibc 2.32. */
     char __libc_single_threaded = 1;
+
+    /* Resolve the real function from libpthread at first call. */
+    #define LAZY(ret, name, params, args) \
+        ret name params { \
+            static ret (*real) params; \
+            if (!real) real = dlsym(RTLD_NEXT, #name); \
+            return real args; \
+        }
+
+    LAZY(void*, pthread_getspecific, (unsigned key), (key))
+    LAZY(int, pthread_setspecific, (unsigned key, const void *val), (key, val))
+    LAZY(int, pthread_key_create, (unsigned *key, void (*destr)(void*)), (key, destr))
+    LAZY(int, pthread_once, (int *ctrl, void (*init)(void)), (ctrl, init))
+
+    /* _dl_find_object: added in glibc 2.35 for stack unwinding.
+       Return "not found" so libgcc falls back to dl_iterate_phdr. */
+    int _dl_find_object(void *pc, void *result) {
+        (void)pc; (void)result;
+        return -1;
+    }
 COMPAT
-    $CC -c -o /tmp/glibc_compat.o /tmp/glibc_compat.c
-    ar rs $out/lib/libc_nonshared.a /tmp/glibc_compat.o
+    cat > /tmp/glibc_compat.map <<'VERSCRIPT'
+    GLIBC_2.32 { global: __libc_single_threaded; };
+    GLIBC_2.34 { global: pthread_getspecific; pthread_setspecific;
+                         pthread_key_create; pthread_once; };
+    GLIBC_2.35 { global: _dl_find_object; };
+VERSCRIPT
+    $CC -shared -nostdlib -o $out/lib/libglibc_compat.so.0 /tmp/glibc_compat.c \
+        -Wl,-soname,libglibc_compat.so.0 \
+        -Wl,--version-script,/tmp/glibc_compat.map \
+        -ldl -lgcc
+    ln -s libglibc_compat.so.0 $out/lib/libglibc_compat.so
 
     # Work around a Nix bug: hard links across outputs cause a build failure.
     cp $bin/bin/getconf $bin/bin/getconf_

@@ -1,0 +1,17 @@
+When a required version node (e.g. GLIBC_2.34) is not found in the
+providing library, treat it as non-fatal rather than aborting.  This
+allows binaries linked against newer glibc (e.g. GCC 15's libgcc_s.so
+which requires GLIBC_2.34) to load under glibc 2.27 as long as the
+actual symbols exist (provided by libglibc_compat.so).
+
+--- a/elf/dl-version.c
++++ b/elf/dl-version.c
+@@ -143,7 +143,7 @@ match_symbol (const char *name, Lmid_t ns, ElfW(Word) hash, const char *string,
+   _dl_exception_create_format
+     (&exception, DSO_FILENAME (map->l_name),
+      "version `%s' not found (required by %s)", string, name);
+-  result = 1;
++  result = 0; /* non-fatal: allow compat symbols from other libs */
+  call_cerror:
+   _dl_signal_cexception (0, &exception, N_("version lookup error"));
+   _dl_exception_free (&exception);

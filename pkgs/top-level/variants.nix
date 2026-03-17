@@ -191,7 +191,11 @@ self: super: {
                   # GCC 15 has glibc 2.42 headers hardcoded via -isystem;
                   # override with glibc 2.27 headers at higher priority so
                   # the __isoc23_* redirects in 2.42's stdlib.h are not seen.
-                  echo " -isystem ${glibc227.dev}/include" >> $out/nix-support/cc-cflags
+                  echo " -isystem ${glibc227.dev}/include" >> $out/nix-support/cc-cflags-before
+                  # Link the compat shim that provides versioned symbols
+                  # (pthread_*@GLIBC_2.34, _dl_find_object@GLIBC_2.35) needed
+                  # by GCC 15's libgcc_s.so and libstdc++.so.
+                  echo " -L${glibc227}/lib -lglibc_compat" >> $out/nix-support/cc-ldflags
                 '';
               });
             in
