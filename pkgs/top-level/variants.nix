@@ -144,7 +144,13 @@ self: super: {
 
   pkgsUbuntu = {
     bionic = import ./ubuntu-bionic.nix {
-      inherit lib nixpkgsFun stdenv overlays self;
+      inherit
+        lib
+        nixpkgsFun
+        stdenv
+        overlays
+        ;
+      sysroot = self.callPackage ../development/libraries/ubuntu-sysroot/bionic.nix { };
     };
   };
 
