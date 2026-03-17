@@ -199,6 +199,18 @@ stdenv.mkDerivation {
   installFlags = [ "sysconfdir=$(out)/etc" ];
 
   postInstall = ''
+    # Provide forward-compat shims for glibc symbols that are referenced
+    # by packages built with modern GCC but don't exist in glibc 2.27.
+    # These are added to libc_nonshared.a which is always linked.
+    cat > /tmp/glibc_compat.c <<'COMPAT'
+    /* __libc_single_threaded: added in glibc 2.32.
+       Default to single-threaded; pthread_create won't update this
+       in glibc 2.27, but the symbol existing prevents link errors. */
+    char __libc_single_threaded = 1;
+COMPAT
+    $CC -c -o /tmp/glibc_compat.o /tmp/glibc_compat.c
+    ar rs $out/lib/libc_nonshared.a /tmp/glibc_compat.o
+
     moveToOutput bin/getent $getent
 
     test -f $out/etc/ld.so.cache && rm $out/etc/ld.so.cache

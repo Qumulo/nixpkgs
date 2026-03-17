@@ -174,14 +174,33 @@ self: super: {
               # overriding the cc/bintools wrappers.  Early stages lack
               # the override mechanism on cc and bintools.
               cc = super'.stdenv.cc;
+              # Only override at the final stage (not bootstrap stages).
+              # Bootstrap stages have names like "bootstrap-stage2-stdenv-linux";
+              # only the final stdenv is named "stdenv-linux".
               ready =
                 cc != null
                 && cc ? override
                 && cc ? bintools
-                && cc.bintools ? override;
+                && cc.bintools ? override
+                && !(lib.hasPrefix "bootstrap" (super'.stdenv.name or "bootstrap"));
 
               newBintools = cc.bintools.override { libc = glibc227; };
-              newCc = cc.override { libc = glibc227; bintools = newBintools; };
+              # GCC 15 defaults to C23 and emits __isoc23_* symbol
+              # refs (e.g. __isoc23_strtoul) that glibc 2.27 lacks.
+              # Append -std=gnu17 to the cc-wrapper's cc-cflags file
+              # so it applies to every compilation in this variant.
+              newCc = (cc.override {
+                libc = glibc227;
+                bintools = newBintools;
+              }).overrideAttrs (old: {
+                postFixup = (old.postFixup or "") + "\n" + ''
+                  # GCC 15 defaults to C23 (__isoc23_* symbols).
+                  echo " -std=gnu17" >> $out/nix-support/cc-cflags
+                  # GCC 15 has glibc 2.42 headers hardcoded via -isystem.
+                  # Override with glibc 2.27 headers at higher priority.
+                  echo " -isystem ${glibc227.dev}/include" >> $out/nix-support/cc-cflags
+                '';
+              });
             in
             {
               pkgsGlibc227 = super';
