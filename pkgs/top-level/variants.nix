@@ -120,6 +120,30 @@ self: super: {
     }) (lib.attrNames self._cuda.db.cudaCapabilityToInfo)
   );
 
+  # Cross-compilation targeting Ubuntu releases.
+  # Produces binaries linked against Ubuntu's glibc, using LLVM toolchain.
+  # Usage: pkgsUbuntu.bionic.hello
+  pkgsUbuntu = {
+    bionic = nixpkgsFun {
+      overlays = [
+        (self': super': {
+          pkgsUbuntu = super'.pkgsUbuntu or { } // {
+            bionic = super';
+          };
+        })
+      ] ++ overlays;
+      crossSystem = stdenv.hostPlatform // {
+        useLLVM = true;
+        linker = "lld";
+      };
+      crossOverlays = [
+        (crossSelf: crossSuper: {
+          glibc = self.callPackage ../development/libraries/ubuntu-sysroot/bionic.nix { };
+        })
+      ];
+    };
+  };
+
   pkgsExtraHardening = nixpkgsFun {
     overlays = [
       (
