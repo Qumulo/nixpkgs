@@ -152,6 +152,54 @@ self: super: {
     }) (lib.attrNames self._cuda.db.cudaCapabilityToInfo)
   );
 
+  # All packages built against glibc 2.27 for binary compatibility with
+  # Ubuntu 18.04 (Bionic), RHEL 7+, and manylinux2014-era systems.
+  # The stdenv's cc-wrapper and bintools-wrapper are rebuilt to link
+  # against glibc 2.27; the compiler itself remains from the host stdenv.
+  pkgsGlibc227 =
+    if stdenv.hostPlatform.isLinux then
+      let
+        # Build glibc 2.27 using the OUTER (non-variant) package set.
+        # This avoids circular dependencies: the variant's stdenv depends
+        # on glibc 2.27, so glibc 2.27 must not depend on the variant's stdenv.
+        glibc227 = self.callPackage ../development/libraries/glibc-2_27 {
+          stdenv = self.gccStdenv;
+        };
+      in
+      nixpkgsFun {
+        overlays = [
+          (
+            self': super':
+            let
+              # Detect whether we're at a bootstrap stage that supports
+              # overriding the cc/bintools wrappers.  Early stages lack
+              # the override mechanism on cc and bintools.
+              cc = super'.stdenv.cc;
+              ready =
+                cc != null
+                && cc ? override
+                && cc ? bintools
+                && cc.bintools ? override;
+
+              newBintools = cc.bintools.override { libc = glibc227; };
+              newCc = cc.override { libc = glibc227; bintools = newBintools; };
+            in
+            {
+              pkgsGlibc227 = super';
+            }
+            // lib.optionalAttrs ready {
+              stdenv = super'.stdenv.override {
+                cc = newCc;
+                allowedRequisites = null;
+              };
+            }
+          )
+        ]
+        ++ overlays;
+      }
+    else
+      throw "pkgsGlibc227 is only supported on Linux.";
+
   pkgsExtraHardening = nixpkgsFun {
     overlays = [
       (
