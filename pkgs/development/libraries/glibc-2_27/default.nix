@@ -22,9 +22,9 @@
 }:
 
 let
-  # glibc <=2.36 is incompatible with GNU Make >=4.4 (BZ#29564 and
-  # additional pattern-rule evaluation changes).  Crosstool-ng's
-  # solution is to build with Make 4.3; we do the same.
+  # glibc <=2.36 is incompatible with GNU Make >=4.4: pattern-rule
+  # evaluation changes cause infinite loops.  Pin Make 4.3 (the Trofi
+  # MAKEFLAGS patch is also applied as belt-and-suspenders).
   gnumake_4_3 = gnumake.overrideAttrs (old: {
     version = "4.3";
     src = fetchurl {
@@ -73,18 +73,6 @@ stdenv.mkDerivation {
     # nscd needs libgcc, and we don't want it dynamically linked
     # because we don't want it to depend on bootstrap-tools libs.
     echo "LDFLAGS-nscd += -static-libgcc" >> nscd/Makefile
-
-    # glibc 2.27 uses the deprecated fgrep/egrep commands.  Provide
-    # wrapper scripts rather than sed-replacing, because variables like
-    # FGREP must not be mangled.
-    mkdir -p $TMPDIR/compat-bin
-    echo '#!/bin/sh' > $TMPDIR/compat-bin/fgrep
-    echo 'exec grep -F "$@"' >> $TMPDIR/compat-bin/fgrep
-    chmod +x $TMPDIR/compat-bin/fgrep
-    echo '#!/bin/sh' > $TMPDIR/compat-bin/egrep
-    echo 'exec grep -E "$@"' >> $TMPDIR/compat-bin/egrep
-    chmod +x $TMPDIR/compat-bin/egrep
-    export PATH="$TMPDIR/compat-bin:$PATH"
   '';
 
   configureFlags =
@@ -199,18 +187,6 @@ stdenv.mkDerivation {
   installFlags = [ "sysconfdir=$(out)/etc" ];
 
   postInstall = ''
-    # Provide forward-compat shims for glibc symbols that are referenced
-    # by packages built with modern GCC but don't exist in glibc 2.27.
-    # These are added to libc_nonshared.a which is always linked.
-    cat > /tmp/glibc_compat.c <<'COMPAT'
-    /* __libc_single_threaded: added in glibc 2.32.
-       Default to single-threaded; pthread_create won't update this
-       in glibc 2.27, but the symbol existing prevents link errors. */
-    char __libc_single_threaded = 1;
-COMPAT
-    $CC -c -o /tmp/glibc_compat.o /tmp/glibc_compat.c
-    ar rs $out/lib/libc_nonshared.a /tmp/glibc_compat.o
-
     moveToOutput bin/getent $getent
 
     test -f $out/etc/ld.so.cache && rm $out/etc/ld.so.cache
@@ -240,6 +216,16 @@ COMPAT
     # Some of *.a files are linker scripts where moving broke the paths.
     sed "/^GROUP/s|$out/lib/lib|$static/lib/lib|g" \
       -i "$static"/lib/*.a
+
+    # Provide forward-compat shims for glibc symbols that don't exist in
+    # 2.27 but are referenced by packages built with modern toolchains.
+    # Added after the .a relocation so we modify the final libc_nonshared.a.
+    cat > /tmp/glibc_compat.c <<'COMPAT'
+    /* __libc_single_threaded: added in glibc 2.32. */
+    char __libc_single_threaded = 1;
+COMPAT
+    $CC -c -o /tmp/glibc_compat.o /tmp/glibc_compat.c
+    ar rs $out/lib/libc_nonshared.a /tmp/glibc_compat.o
 
     # Work around a Nix bug: hard links across outputs cause a build failure.
     cp $bin/bin/getconf $bin/bin/getconf_
