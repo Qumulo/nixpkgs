@@ -5,26 +5,15 @@
 #
 # The full nixpkgs package set is available, but individual packages may
 # need adjustments (e.g. disabling tests that assume a working NSS stack).
-# Add per-package overrides in the crossOverlays below.
+# Add per-package overrides in the crossOverlay below.
 {
   lib,
-  self,
   nixpkgsFun,
   stdenv,
   overlays,
+  sysroot,
 }:
 
-let
-  sysroot = self.callPackage ../development/libraries/ubuntu-sysroot/bionic.nix { };
-
-  # Per-package overrides for the cross (host) package set.
-  # crossSuper is the unmodified cross package; use overrideAttrs to adjust.
-  packageOverrides = crossSelf: crossSuper: {
-    # wolfssl's test suite does hostname resolution via NSS, which doesn't
-    # work with Ubuntu's vanilla glibc inside the Nix sandbox.
-    wolfssl = crossSuper.wolfssl.overrideAttrs { doCheck = false; };
-  };
-in
 nixpkgsFun {
   overlays = [
     (self': super': {
@@ -32,7 +21,8 @@ nixpkgsFun {
         bionic = super';
       };
     })
-  ] ++ overlays;
+  ]
+  ++ overlays;
 
   crossSystem = stdenv.hostPlatform // {
     useLLVM = true;
@@ -42,7 +32,12 @@ nixpkgsFun {
   crossOverlays = [
     (crossSelf: crossSuper: {
       glibc = sysroot;
+
+      # Per-package overrides:
+
+      # wolfssl's test suite does hostname resolution via NSS, which doesn't
+      # work with Ubuntu's vanilla glibc inside the Nix sandbox.
+      wolfssl = crossSuper.wolfssl.overrideAttrs { doCheck = false; };
     })
-    packageOverrides
   ];
 }
