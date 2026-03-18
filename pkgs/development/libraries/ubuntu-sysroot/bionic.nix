@@ -12,7 +12,6 @@ stdenvNoCC.mkDerivation {
   outputs = [
     "out"
     "dev"
-    "bin"
     "static"
   ];
 
@@ -35,31 +34,26 @@ stdenvNoCC.mkDerivation {
 
   sourceRoot = ".";
 
-  unpackPhase = ''
-    runHook preUnpack
-    for src in $srcs; do
-      dpkg-deb --fsys-tarfile "$src" | tar xf -
-    done
-    runHook postUnpack
-  '';
-
   installPhase = ''
     runHook preInstall
+
+    # dpkg unpack hook extracts each .deb into root/
+    local s=root
 
     # --- $out: shared libraries + CRT objects ---
     mkdir -p $out/lib
 
     # Shared libraries from libc6 (./lib/x86_64-linux-gnu/)
-    cp -a lib/x86_64-linux-gnu/* $out/lib/
+    cp -a $s/lib/x86_64-linux-gnu/* $out/lib/
 
     # CRT objects + linker scripts + static nonshared libs from libc6-dev
     # (./usr/lib/x86_64-linux-gnu/)
-    cp -a usr/lib/x86_64-linux-gnu/*.o $out/lib/
-    cp -a usr/lib/x86_64-linux-gnu/*_nonshared.a $out/lib/
+    cp -a $s/usr/lib/x86_64-linux-gnu/*.o $out/lib/
+    cp -a $s/usr/lib/x86_64-linux-gnu/*_nonshared.a $out/lib/
 
     # Development .so files from libc6-dev: a mix of linker scripts and symlinks.
     # Both contain absolute Ubuntu paths that need rewriting.
-    for f in usr/lib/x86_64-linux-gnu/*.so; do
+    for f in $s/usr/lib/x86_64-linux-gnu/*.so; do
       name=$(basename "$f")
       # Skip if we already have this file (e.g. from the libc6 runtime package)
       [ -e "$out/lib/$name" ] && continue
@@ -70,10 +64,7 @@ stdenvNoCC.mkDerivation {
         ln -s "$target" "$out/lib/$name"
       elif [ -f "$f" ]; then
         # Linker script: rewrite absolute paths
-        # N.B. /usr/lib must be replaced before /lib to avoid partial matches
-        sed \
-          -e "s|/usr/lib/x86_64-linux-gnu/|$out/lib/|g" \
-          -e "s|/lib/x86_64-linux-gnu/|$out/lib/|g" \
+        sed -E "s|(/usr)?/lib/x86_64-linux-gnu/|$out/lib/|g" \
           "$f" > "$out/lib/$name"
       fi
     done
@@ -82,24 +73,19 @@ stdenvNoCC.mkDerivation {
     mkdir -p $dev/include
 
     # Main glibc headers from libc6-dev (./usr/include/)
-    cp -a usr/include/* $dev/include/
+    cp -a $s/usr/include/* $dev/include/
 
     # Arch-specific headers go on top (./usr/include/x86_64-linux-gnu/)
     # These contain bits/, gnu/, sys/ subdirs that override/supplement the main ones
-    if [ -d usr/include/x86_64-linux-gnu ]; then
-      cp -a usr/include/x86_64-linux-gnu/* $dev/include/
-      rm -rf $dev/include/x86_64-linux-gnu
-    fi
+    cp -a $s/usr/include/x86_64-linux-gnu/* $dev/include/
+    rm -rf $dev/include/x86_64-linux-gnu
 
     # Kernel headers from linux-libc-dev are already in usr/include/
     # (asm/, asm-generic/, linux/) - they were copied above
 
-    # --- $bin: minimal (not needed for cross-compilation) ---
-    mkdir -p $bin/bin
-
     # --- $static: static libraries ---
     mkdir -p $static/lib
-    cp -a usr/lib/x86_64-linux-gnu/*.a $static/lib/ 2>/dev/null || true
+    cp -a $s/usr/lib/x86_64-linux-gnu/*.a $static/lib/
     # Remove the nonshared libs we already put in $out
     rm -f $static/lib/*_nonshared.a
 
