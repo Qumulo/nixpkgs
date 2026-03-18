@@ -108,6 +108,36 @@ nixpkgsFun {
           (old.buildInputs or [ ]);
       });
 
+      # RPM: rpm-sequoia's Rust build scripts load the cross-sysroot's
+      # libpthread which lacks GLIBC_PRIVATE symbols.  audit needs newer
+      # kernel headers.  systemd needs glibc 2.28+ threads.h.
+      rpm = (crossSuper.rpm.override {
+        rpm-sequoia = null;
+        audit = null;
+        systemd = null;
+        gnupg = (crossSelf.gnupg.override {
+          withPcsc = false;
+          withTpm2Tss = false;
+          openldap = null;
+          guiSupport = false;
+          libusb1 = null;
+        }).overrideAttrs (old: {
+          configureFlags = (old.configureFlags or [ ]) ++ [
+            "am_cv_func_iconv_works=yes"
+          ];
+        });
+      }).overrideAttrs (old: {
+        cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+          "-DWITH_AUDIT=OFF"
+          "-DWITH_SELINUX=OFF"
+          "-DWITH_SEQUOIA=OFF"
+          "-DWITH_INTERNAL_OPENPGP=ON"
+        ];
+        buildInputs = (old.buildInputs or [ ]) ++ [
+          crossSelf.libgcrypt
+        ];
+      });
+
       gettext = crossSuper.gettext.overrideAttrs (old: {
         configureFlags = (old.configureFlags or [ ]) ++ [
           "am_cv_func_iconv=yes"
