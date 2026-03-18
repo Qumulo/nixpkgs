@@ -138,6 +138,43 @@ nixpkgsFun {
         ];
       });
 
+      # audit requires kernel headers newer than Ubuntu Bionic's 4.15
+      # (linux/io_uring.h, AUDIT_ARCH_RISCV*).  Disable it everywhere.
+      linux-pam = crossSuper.linux-pam.override { withAudit = false; };
+      dbus = crossSuper.dbus.override { audit = null; enableSystemd = false; };
+
+      # libpcap: bluez needs dbus+audit chain (broken on Bionic).
+      libpcap = crossSuper.libpcap.override { withBluez = false; };
+      # wireshark-cli: disable bluez in libpcap, skip speexdsp (needs
+      # Fortran/fftw), skip spandsp3 (needs fftw too).
+      wireshark-cli = (crossSuper.wireshark-cli.override {
+        libpcap' = crossSelf.libpcap;
+        spandsp3 = null;
+      }).overrideAttrs (old: {
+        cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+          "-DBUILD_sharkd=OFF"
+          "-DBUILD_stratoshark=OFF"
+        ];
+        buildInputs = builtins.filter
+          (i: (i.pname or "") != "speexdsp")
+          (old.buildInputs or [ ]);
+        # CMake applies cross-compiler (clang) flags to the native lemon
+        # build. Strip clang-specific flags from the generated build file.
+        postConfigure = (old.postConfigure or "") + ''
+          sed -i 's/-Xclang -analyzer-disable-all-checks//g' build.ninja
+          sed -i 's/-fno-sanitize=all//g' build.ninja
+        '';
+        # Ubuntu Bionic's kernel headers (4.15) lack NL80211_BAND_6GHZ.
+        env = (old.env or { }) // {
+          NIX_CFLAGS_COMPILE = (old.env.NIX_CFLAGS_COMPILE or "")
+            + " -DNL80211_BAND_6GHZ=5";
+        };
+      });
+
+      # libcap: Go can't cross-compile (sysroot contamination),
+      # PAM needs audit.
+      libcap = crossSuper.libcap.override { withGo = false; usePam = false; };
+
       gettext = crossSuper.gettext.overrideAttrs (old: {
         configureFlags = (old.configureFlags or [ ]) ++ [
           "am_cv_func_iconv=yes"
