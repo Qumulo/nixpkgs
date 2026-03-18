@@ -98,6 +98,16 @@ nixpkgsFun {
       # tries to run a test binary which fails under cross-compilation.
       # Also, clang 21 treats an incompatible function pointer in
       # iconv-ostream.c as a hard error.
+      # Graphviz: gts, pango, and gd pull in glib variants with
+      # introspection enabled through splicing, which can't
+      # cross-compile.  The core libraries (libcgraph, libgvc,
+      # libgvpr, libpathplan, libxdot) don't need them.
+      graphviz = (crossSuper.graphviz.override { withXorg = false; }).overrideAttrs (old: {
+        buildInputs = builtins.filter
+          (i: !builtins.elem (i.pname or "") [ "gts" "pango" "gd" ])
+          (old.buildInputs or [ ]);
+      });
+
       gettext = crossSuper.gettext.overrideAttrs (old: {
         configureFlags = (old.configureFlags or [ ]) ++ [
           "am_cv_func_iconv=yes"
