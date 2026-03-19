@@ -140,7 +140,12 @@ nixpkgsFun {
 
       # audit requires kernel headers newer than Ubuntu Bionic's 4.15
       # (linux/io_uring.h, AUDIT_ARCH_RISCV*).  Disable it everywhere.
-      linux-pam = crossSuper.linux-pam.override { withAudit = false; };
+      linux-pam = (crossSuper.linux-pam.override { withAudit = false; withLogind = false; }).overrideAttrs (old: {
+        # lld errors on version scripts referencing undefined symbols (GNU ld
+        # silently allows it).  PAM modules only implement a subset of the
+        # pam_sm_* entry points but share a single modules.map.
+        NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " --undefined-version";
+      });
       dbus = crossSuper.dbus.override { audit = null; enableSystemd = false; };
 
       # libpcap: bluez needs dbus+audit chain (broken on Bionic).
@@ -169,6 +174,20 @@ nixpkgsFun {
           NIX_CFLAGS_COMPILE = (old.env.NIX_CFLAGS_COMPILE or "")
             + " -DNL80211_BAND_6GHZ=5";
         };
+      });
+
+      # systemd 259 needs glibc 2.28+ (threads.h, struct statx).
+      # openldap can build without it.  Tests try to run cross-compiled
+      # slapd which can't execute on the build host.
+      openldap = (crossSuper.openldap.override { withSystemd = false; }).overrideAttrs { doCheck = false; };
+
+      # lld errors on version scripts that list symbols not present in the
+      # binary (GNU ld silently ignores them).  heimdal's libroken version
+      # map lists compat shims (err, fseeko, etc.) that glibc already
+      # provides, so they're not compiled on Linux.
+      heimdal = crossSuper.heimdal.overrideAttrs (old: {
+        NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " --undefined-version";
+        doCheck = false;
       });
 
       # libcap: Go can't cross-compile (sysroot contamination),
