@@ -189,6 +189,9 @@ nixpkgsFun {
         NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " --undefined-version";
         doCheck = false;
       });
+      heimdal-qumulo = crossSuper.heimdal-qumulo.overrideAttrs (old: {
+        NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " --undefined-version";
+      });
 
       # libcap: Go can't cross-compile (sysroot contamination),
       # PAM needs audit.
