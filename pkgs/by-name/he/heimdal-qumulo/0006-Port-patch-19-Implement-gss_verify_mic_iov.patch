@@ -1,0 +1,361 @@
+From 7f81600da9a8c1cab3f66ebc15a7b602f361e09e Mon Sep 17 00:00:00 2001
+From: Philip Taron <philip@qumulo.com>
+Date: Thu, 19 Mar 2026 17:03:34 -0700
+Subject: [PATCH 6/7] Port patch 19: Implement gss_verify_mic_iov()
+
+Add IOV-based MIC verification, the inverse of gss_get_mic_iov().
+Validates token header, flags, sequence number, then verifies the
+checksum over the IOV data buffers. CFX-only (AES+HMAC-SHA).
+New vtable entry gm_verify_mic_iov added to all mechanism interfaces.
+---
+ lib/gssapi/gssapi/gssapi.h       |   8 ++
+ lib/gssapi/gssapi_mech.h         |   9 +++
+ lib/gssapi/krb5/cfx.c            | 132 +++++++++++++++++++++++++++++++
+ lib/gssapi/krb5/external.c       |   1 +
+ lib/gssapi/krb5/verify_mic.c     |  22 ++++++
+ lib/gssapi/libgssapi-exports.def |   1 +
+ lib/gssapi/mech/gss_verify_mic.c |  26 ++++++
+ lib/gssapi/netlogon/external.c   |   1 +
+ lib/gssapi/ntlm/external.c       |   1 +
+ lib/gssapi/sanon/external.c      |   1 +
+ lib/gssapi/spnego/external.c     |   1 +
+ lib/gssapi/version-script.map    |   1 +
+ 12 files changed, 204 insertions(+)
+
+diff --git a/lib/gssapi/gssapi/gssapi.h b/lib/gssapi/gssapi/gssapi.h
+index 56c2549a1..d487e5a5c 100644
+--- a/lib/gssapi/gssapi/gssapi.h
++++ b/lib/gssapi/gssapi/gssapi.h
+@@ -955,6 +955,14 @@ gss_decapsulate_token(gss_const_buffer_t /* input_token */,
+ GSSAPI_LIB_FUNCTION OM_uint32 GSSAPI_LIB_CALL
+ gss_get_mic_iov(OM_uint32 *, gss_const_ctx_id_t, gss_iov_buffer_desc *, int);
+ 
++GSSAPI_LIB_FUNCTION OM_uint32 GSSAPI_LIB_CALL
++gss_verify_mic_iov(
++	OM_uint32 *,
++	gss_const_ctx_id_t,
++	gss_iov_buffer_desc *,
++	int,
++	const gss_buffer_t);
++
+ GSSAPI_LIB_FUNCTION OM_uint32 GSSAPI_LIB_CALL
+ gss_wrap_iov(OM_uint32 *, gss_ctx_id_t, int, gss_qop_t, int *,
+ 	     gss_iov_buffer_desc *, int);
+diff --git a/lib/gssapi/gssapi_mech.h b/lib/gssapi/gssapi_mech.h
+index 65f0249a8..6f556e763 100644
+--- a/lib/gssapi/gssapi_mech.h
++++ b/lib/gssapi/gssapi_mech.h
+@@ -124,6 +124,14 @@ typedef OM_uint32 GSSAPI_CALLCONV _gss_verify_mic_t
+ 	       gss_qop_t *             /* qop_state */
+ 	      );
+ 
++typedef OM_uint32 GSSAPI_CALLCONV _gss_verify_mic_iov_t
++	      (OM_uint32 *minor_status,
++	        gss_const_ctx_id_t context_handle,
++	        gss_iov_buffer_desc *iov, /* message iov */
++	        int iov_count,
++	        const gss_buffer_t token_buffer
++	      );
++
+ typedef OM_uint32 GSSAPI_CALLCONV _gss_wrap_t
+ 	      (OM_uint32 *,            /* minor_status */
+ 	       gss_const_ctx_id_t,     /* context_handle */
+@@ -588,6 +596,7 @@ typedef struct gssapi_mech_interface_desc {
+ 	_gss_get_mic_t			*gm_get_mic;
+ 	_gss_get_mic_iov_t		*gm_get_mic_iov;
+ 	_gss_verify_mic_t		*gm_verify_mic;
++	_gss_verify_mic_iov_t	*gm_verify_mic_iov;
+ 	_gss_wrap_t			*gm_wrap;
+ 	_gss_unwrap_t			*gm_unwrap;
+ 	_gss_display_status_t		*gm_display_status;
+diff --git a/lib/gssapi/krb5/cfx.c b/lib/gssapi/krb5/cfx.c
+index d67ad97fc..c26cd0f01 100644
+--- a/lib/gssapi/krb5/cfx.c
++++ b/lib/gssapi/krb5/cfx.c
+@@ -1959,3 +1959,135 @@ failure:
+ 
+ 	return major_status;
+ }
++
++OM_uint32
++_gssapi_verify_mic_iov(
++	OM_uint32 *minor_status,
++	gsskrb5_ctx ctx,
++	krb5_context context,
++	gss_iov_buffer_desc *iov,
++	int iov_count,
++	const gss_buffer_t token_buffer)
++{
++	OM_uint32 major_status, junk;
++	int i;
++	gss_cfx_mic_token token;
++	krb5_error_code ret;
++	unsigned usage;
++	krb5_crypto_iov *data = NULL;
++	u_char token_flags;
++	OM_uint32 seq_number_lo, seq_number_hi;
++
++	*minor_status = 0;
++
++	if (token_buffer->length < sizeof(*token)) {
++		return GSS_S_DEFECTIVE_TOKEN;
++	}
++
++	token = (gss_cfx_mic_token)token_buffer->value;
++
++	if (token->TOK_ID[0] != 0x04 || token->TOK_ID[1] != 0x04) {
++		return GSS_S_DEFECTIVE_TOKEN;
++	}
++
++	/* Ignore unknown flags */
++	token_flags = token->Flags & (CFXSentByAcceptor | CFXAcceptorSubkey);
++
++	if (token_flags & CFXSentByAcceptor) {
++		if ((ctx->more_flags & LOCAL) == 0) {
++			return GSS_S_DEFECTIVE_TOKEN;
++		}
++	}
++
++	if (ctx->more_flags & ACCEPTOR_SUBKEY) {
++		if ((token_flags & CFXAcceptorSubkey) == 0) {
++			return GSS_S_DEFECTIVE_TOKEN;
++		}
++	} else {
++		if (token_flags & CFXAcceptorSubkey) {
++			return GSS_S_DEFECTIVE_TOKEN;
++		}
++	}
++
++	if (ct_memcmp(token->Filler, "\xff\xff\xff\xff\xff", 5) != 0) {
++		return GSS_S_DEFECTIVE_TOKEN;
++	}
++
++	/*
++	 * Check sequence number
++	 */
++	_gss_mg_decode_be_uint32(&token->SND_SEQ[0], &seq_number_hi);
++	_gss_mg_decode_be_uint32(&token->SND_SEQ[4], &seq_number_lo);
++	if (seq_number_hi) {
++		*minor_status = ERANGE;
++		return GSS_S_UNSEQ_TOKEN;
++	}
++
++	HEIMDAL_MUTEX_lock(&ctx->ctx_id_mutex);
++	ret = _gssapi_msg_order_check(ctx->order, seq_number_lo);
++	if (ret != 0) {
++		*minor_status = 0;
++		HEIMDAL_MUTEX_unlock(&ctx->ctx_id_mutex);
++		return ret;
++	}
++	HEIMDAL_MUTEX_unlock(&ctx->ctx_id_mutex);
++
++	if (ctx->more_flags & LOCAL) {
++		usage = KRB5_KU_USAGE_ACCEPTOR_SIGN;
++	} else {
++		usage = KRB5_KU_USAGE_INITIATOR_SIGN;
++	}
++
++	data = calloc(iov_count + 3, sizeof(data[0]));
++	if (data == NULL) {
++		*minor_status = ENOMEM;
++		return GSS_S_FAILURE;
++	}
++
++	for (i = 0; i < iov_count; i++) {
++		switch (GSS_IOV_BUFFER_TYPE(iov[i].type)) {
++		case GSS_IOV_BUFFER_TYPE_DATA:
++			data[i].flags = KRB5_CRYPTO_TYPE_DATA;
++			break;
++		case GSS_IOV_BUFFER_TYPE_SIGN_ONLY:
++			data[i].flags = KRB5_CRYPTO_TYPE_SIGN_ONLY;
++			break;
++		default:
++			data[i].flags = KRB5_CRYPTO_TYPE_EMPTY;
++			break;
++		}
++		data[i].data.length = iov[i].buffer.length;
++		data[i].data.data = iov[i].buffer.value;
++	}
++
++	data[i].flags = KRB5_CRYPTO_TYPE_DATA;
++	data[i].data.data = token_buffer->value;
++	data[i].data.length = sizeof(*token);
++	i++;
++
++	data[i].flags = KRB5_CRYPTO_TYPE_CHECKSUM;
++	data[i].data.data = (uint8_t *)token_buffer->value + sizeof(*token);
++	data[i].data.length = token_buffer->length - sizeof(*token);
++	i++;
++
++	ret = krb5_verify_checksum_iov(context, ctx->crypto, usage, data, i, NULL);
++	if (ret) {
++		*minor_status = ret;
++		major_status = GSS_S_BAD_MIC;
++		goto failure;
++	}
++
++	free(data);
++
++	*minor_status = 0;
++	return GSS_S_COMPLETE;
++
++failure:
++	if (data) {
++		free(data);
++	}
++
++	gss_release_iov_buffer(&junk, iov, iov_count);
++
++	return major_status;
++}
+diff --git a/lib/gssapi/krb5/external.c b/lib/gssapi/krb5/external.c
+index aa9c82adb..4e021d004 100644
+--- a/lib/gssapi/krb5/external.c
++++ b/lib/gssapi/krb5/external.c
+@@ -348,6 +348,7 @@ static gssapi_mech_interface_desc krb5_mech = {
+     _gsskrb5_get_mic,
+     _gsskrb5_get_mic_iov,
+     _gsskrb5_verify_mic,
++    _gsskrb5_verify_mic_iov,
+     _gsskrb5_wrap,
+     _gsskrb5_unwrap,
+     _gsskrb5_display_status,
+diff --git a/lib/gssapi/krb5/verify_mic.c b/lib/gssapi/krb5/verify_mic.c
+index 3b97a9059..6e4756ba6 100644
+--- a/lib/gssapi/krb5/verify_mic.c
++++ b/lib/gssapi/krb5/verify_mic.c
+@@ -358,3 +358,25 @@ _gsskrb5_verify_mic
+ 
+     return ret;
+ }
++
++OM_uint32 GSSAPI_CALLCONV
++_gsskrb5_verify_mic_iov(
++	OM_uint32 * minor_status,
++	gss_const_ctx_id_t context_handle,
++	gss_iov_buffer_desc *iov,
++	int iov_count,
++	const gss_buffer_t token_buffer)
++{
++	krb5_context context;
++	const gsskrb5_ctx ctx = (const gsskrb5_ctx)context_handle;
++
++	GSSAPI_KRB5_INIT(&context);
++
++	if (ctx->more_flags & IS_CFX) {
++		return _gssapi_verify_mic_iov(
++			minor_status, ctx, context, iov, iov_count, token_buffer);
++	} else {
++		*minor_status = 0;
++		return GSS_S_FAILURE;
++	}
++}
+diff --git a/lib/gssapi/libgssapi-exports.def b/lib/gssapi/libgssapi-exports.def
+index 5368573d1..e00d714cc 100644
+--- a/lib/gssapi/libgssapi-exports.def
++++ b/lib/gssapi/libgssapi-exports.def
+@@ -109,6 +109,7 @@ EXPORTS
+ 	gss_userok
+ 	gss_verify
+ 	gss_verify_mic
++	gss_verify_mic_iov
+ 	gss_wrap
+ 	gss_wrap_aead
+ 	gss_wrap_iov
+diff --git a/lib/gssapi/mech/gss_verify_mic.c b/lib/gssapi/mech/gss_verify_mic.c
+index ae3b52f72..0cbc1c03c 100644
+--- a/lib/gssapi/mech/gss_verify_mic.c
++++ b/lib/gssapi/mech/gss_verify_mic.c
+@@ -50,3 +50,29 @@ gss_verify_mic(OM_uint32 *minor_status,
+ 	return (m->gm_verify_mic(minor_status, ctx->gc_ctx,
+ 		    message_buffer, token_buffer, qop_state));
+ }
++
++GSSAPI_LIB_FUNCTION OM_uint32 GSSAPI_LIB_CALL
++gss_verify_mic_iov(
++	OM_uint32 *minor_status,
++	gss_const_ctx_id_t context_handle,
++	gss_iov_buffer_desc *iov,
++	int iov_count,
++	const gss_buffer_t token_buffer)
++{
++	struct _gss_context *ctx = (struct _gss_context *) context_handle;
++	gssapi_mech_interface m;
++
++	if (ctx == NULL) {
++		*minor_status = 0;
++		return GSS_S_NO_CONTEXT;
++	}
++
++	m = ctx->gc_mech;
++
++	if (m->gm_verify_mic_iov == NULL) {
++		return GSS_S_UNAVAILABLE;
++	}
++
++	return (m->gm_verify_mic_iov(
++		minor_status, ctx->gc_ctx, iov, iov_count, token_buffer));
++}
+diff --git a/lib/gssapi/netlogon/external.c b/lib/gssapi/netlogon/external.c
+index 41aec54ea..8ff5e3cda 100644
+--- a/lib/gssapi/netlogon/external.c
++++ b/lib/gssapi/netlogon/external.c
+@@ -50,6 +50,7 @@ static gssapi_mech_interface_desc netlogon_mech = {
+     _netlogon_get_mic,
+     NULL, /* gm_get_mic_iov */
+     _netlogon_verify_mic,
++    NULL, /* gm_verify_mic_iov */
+     NULL,
+     NULL,
+     _netlogon_display_status,
+diff --git a/lib/gssapi/ntlm/external.c b/lib/gssapi/ntlm/external.c
+index d2da4d488..85d77f0e0 100644
+--- a/lib/gssapi/ntlm/external.c
++++ b/lib/gssapi/ntlm/external.c
+@@ -75,6 +75,7 @@ static gssapi_mech_interface_desc ntlm_mech = {
+     _gss_ntlm_get_mic,
+     NULL, /* gm_get_mic_iov */
+     _gss_ntlm_verify_mic,
++    NULL, /* gm_verify_mic_iov */
+     _gss_ntlm_wrap,
+     _gss_ntlm_unwrap,
+     _gss_ntlm_display_status,
+diff --git a/lib/gssapi/sanon/external.c b/lib/gssapi/sanon/external.c
+index 65f328746..27d402bf1 100644
+--- a/lib/gssapi/sanon/external.c
++++ b/lib/gssapi/sanon/external.c
+@@ -205,6 +205,7 @@ static gssapi_mech_interface_desc sanon_mech = {
+     _gss_sanon_get_mic,
+     NULL, /* gm_get_mic_iov */
+     _gss_sanon_verify_mic,
++    NULL, /* gm_verify_mic_iov */
+     _gss_sanon_wrap,
+     _gss_sanon_unwrap,
+     _gss_sanon_display_status,
+diff --git a/lib/gssapi/spnego/external.c b/lib/gssapi/spnego/external.c
+index ef33a10bd..a62213516 100644
+--- a/lib/gssapi/spnego/external.c
++++ b/lib/gssapi/spnego/external.c
+@@ -99,6 +99,7 @@ static gssapi_mech_interface_desc spnego_mech = {
+     _gss_spnego_get_mic,
+     NULL, /* gm_get_mic_iov */
+     _gss_spnego_verify_mic,
++    NULL, /* gm_verify_mic_iov */
+     _gss_spnego_wrap,
+     _gss_spnego_unwrap,
+     NULL, /* gm_display_status */
+diff --git a/lib/gssapi/version-script.map b/lib/gssapi/version-script.map
+index 95ffbd483..5b39618e1 100644
+--- a/lib/gssapi/version-script.map
++++ b/lib/gssapi/version-script.map
+@@ -103,6 +103,7 @@ HEIMDAL_GSS_2.0 {
+ 		gss_userok;
+ 		gss_verify;
+ 		gss_verify_mic;
++		gss_verify_mic_iov;
+ 		gss_wrap;
+ 		gss_wrap_aead;
+ 		gss_wrap_iov;
+-- 
+2.53.0
+

@@ -1,0 +1,516 @@
+From 375f6ad218937b8b05b63ab3a953938d1c9a4cc5 Mon Sep 17 00:00:00 2001
+From: Philip Taron <philip@qumulo.com>
+Date: Thu, 19 Mar 2026 16:56:04 -0700
+Subject: [PATCH 1/7] Apply clean Qumulo patches (01, 03, 13, 17, 32)
+
+01-custom-ntlm-server: Custom NTLM server support
+03-mock-clock: Mock clock for testing
+13-export-sspi-session-key-oid: Export SSPI session key OID
+17-gsskrb5-release-name: gsskrb5 release name fix
+32-hooks: Hooks support
+---
+ lib/base/config_file.c               | 24 +++++++++++++++-
+ lib/base/version-script.map          |  4 +++
+ lib/gssapi/gssapi/gssapi_ntlm.h      | 41 ++++++++++++++++++++++++++
+ lib/gssapi/krb5/release_name.c       |  5 +---
+ lib/gssapi/libgssapi-exports.def     |  2 ++
+ lib/gssapi/ntlm/accept_sec_context.c | 26 +++++++++++++----
+ lib/gssapi/ntlm/init_sec_context.c   | 43 ++++++++++++++++++++++++++--
+ lib/gssapi/ntlm/kdc.c                | 14 ---------
+ lib/gssapi/ntlm/ntlm.h               | 30 -------------------
+ lib/gssapi/version-script.map        |  6 ++++
+ lib/krb5/keytab.c                    | 23 ++++++++++++++-
+ lib/krb5/time.c                      | 29 +++++++++++++++----
+ lib/krb5/version-script.map          |  4 +++
+ 13 files changed, 189 insertions(+), 62 deletions(-)
+
+diff --git a/lib/base/config_file.c b/lib/base/config_file.c
+index b1675ea5f..5ddbd7c15 100644
+--- a/lib/base/config_file.c
++++ b/lib/base/config_file.c
+@@ -42,6 +42,28 @@
+ #include <CoreFoundation/CoreFoundation.h>
+ #endif
+ 
++/*
++ * Qumulo
++ */
++
++static FILE *(*qumulo_fopen_config_file)(const char *) = NULL;
++
++static FILE *
++heimdal_fopen_config_file(const char *fname)
++{
++    if (qumulo_fopen_config_file != NULL) {
++        return qumulo_fopen_config_file(fname);
++    }
++
++    return fopen(fname, "r");
++}
++
++void
++heimdal_set_qumulo_fopen_config_file(void *f)
++{
++    qumulo_fopen_config_file = f;
++}
++
+ /* Gaah! I want a portable funopen */
+ struct fileptr {
+     heim_context context;
+@@ -633,7 +655,7 @@ heim_config_parse_file_multi(heim_context context,
+         fname = newfname = exp_fname;
+ 
+         f.context = context;
+-        f.f = fopen(fname, "r");
++        f.f = heimdal_fopen_config_file(fname);
+         f.s = NULL;
+         if (f.f == NULL || fstat(fileno(f.f), &st) == -1) {
+             if (f.f != NULL)
+diff --git a/lib/base/version-script.map b/lib/base/version-script.map
+index 1ba889929..44714cbf2 100644
+--- a/lib/base/version-script.map
++++ b/lib/base/version-script.map
+@@ -206,6 +206,10 @@ HEIMDAL_BASE_1.0 {
+ 		heim_warnx;
+ 		initialize_heim_error_table;
+ 		initialize_heim_error_table_r;
++
++                # Qumulo
++		heimdal_set_qumulo_fopen_config_file;
++
+ 	local:
+ 		*;
+ };
+diff --git a/lib/gssapi/gssapi/gssapi_ntlm.h b/lib/gssapi/gssapi/gssapi_ntlm.h
+index e37c003c7..8e8df1b28 100644
+--- a/lib/gssapi/gssapi/gssapi_ntlm.h
++++ b/lib/gssapi/gssapi/gssapi_ntlm.h
+@@ -37,5 +37,46 @@
+ #define GSSAPI_NTLM_H_
+ 
+ #include <gssapi.h>
++#include <heimntlm.h>
++
++/* Allow users to override the ntlm server interface used in gssapi */
++
++typedef OM_uint32
++(*ntlm_interface_init)(OM_uint32 * /* minor */, void ** /* ctx */);
++
++typedef OM_uint32
++(*ntlm_interface_destroy)(OM_uint32 * /* minor */, void * /* ctx */);
++
++typedef int
++(*ntlm_interface_probe)(OM_uint32 * /* minor */, void * /* ctx */,
++                        const char * /* realm_always_null */);
++
++typedef OM_uint32
++(*ntlm_interface_type2)(OM_uint32 * /* minor */, void * /* ctx */,
++                        uint32_t /* flags */, const char * /* hostname */,
++                        const char * /* domain */, uint32_t * /* ret_flags */,
++                        struct ntlm_buf * /* encoded_ntlm_type2 */);
++
++typedef OM_uint32
++(*ntlm_interface_type3)(OM_uint32 * /* minor */, void * /* ctx */,
++                        const struct ntlm_type3 * /* request */,
++                        struct ntlm_buf * /* session_key */);
++
++struct ntlm_server_interface {
++    ntlm_interface_init nsi_init;
++    ntlm_interface_destroy nsi_destroy;
++    ntlm_interface_probe nsi_probe;
++    ntlm_interface_type2 nsi_type2;
++    ntlm_interface_type3 nsi_type3;
++};
++
++/*
++ * Override the server interface.
++ * This is not thread safe, do once before first gss_accept_sec_context()
++ * The default is to use kdc_digest
++ */
++ 
++GSSAPI_LIB_FUNCTION OM_uint32 GSSAPI_LIB_CALL gss_ntlm_set_server_interface(
++            struct ntlm_server_interface *);
+ 
+ #endif /* GSSAPI_NTLM_H_ */
+diff --git a/lib/gssapi/krb5/release_name.c b/lib/gssapi/krb5/release_name.c
+index 57fc8a4e4..ccb72b0aa 100644
+--- a/lib/gssapi/krb5/release_name.c
++++ b/lib/gssapi/krb5/release_name.c
+@@ -38,16 +38,13 @@ OM_uint32 GSSAPI_CALLCONV _gsskrb5_release_name
+             gss_name_t * input_name
+            )
+ {
+-    krb5_context context;
+     krb5_principal name = (krb5_principal)*input_name;
+ 
+     *minor_status = 0;
+ 
+-    GSSAPI_KRB5_INIT (&context);
+-
+     *input_name = GSS_C_NO_NAME;
+ 
+-    krb5_free_principal(context, name);
++    krb5_free_principal(NULL, name);
+ 
+     return GSS_S_COMPLETE;
+ }
+diff --git a/lib/gssapi/libgssapi-exports.def b/lib/gssapi/libgssapi-exports.def
+index 6077c8e26..0b4c3949d 100644
+--- a/lib/gssapi/libgssapi-exports.def
++++ b/lib/gssapi/libgssapi-exports.def
+@@ -76,6 +76,7 @@ EXPORTS
+         gss_mo_list
+         gss_mo_name
+         gss_name_to_oid
++        gss_ntlm_set_server_interface
+         gss_oid_to_name
+ 	gss_oid_equal
+ 	gss_oid_to_str
+@@ -153,6 +154,7 @@ EXPORTS
+ 	__gss_krb5_get_time_offset_x_oid_desc	DATA
+ 	__gss_krb5_plugin_register_x_oid_desc	DATA
+ 	__gss_ntlm_get_session_key_x_oid_desc	DATA
++	__gss_c_inq_sspi_session_key_oid_desc	DATA
+ 	__gss_c_nt_ntlm_oid_desc	DATA
+ 	__gss_c_nt_dn_oid_desc	DATA
+ 	__gss_krb5_nt_principal_name_referral_oid_desc	DATA
+diff --git a/lib/gssapi/ntlm/accept_sec_context.c b/lib/gssapi/ntlm/accept_sec_context.c
+index 6a3e8899e..5e135eba1 100644
+--- a/lib/gssapi/ntlm/accept_sec_context.c
++++ b/lib/gssapi/ntlm/accept_sec_context.c
+@@ -33,6 +33,22 @@
+ 
+ #include "ntlm.h"
+ 
++static struct ntlm_server_interface *ns_interface = NULL;
++
++/*
++ *
++ */
++
++GSSAPI_LIB_FUNCTION OM_uint32 GSSAPI_LIB_CALL
++gss_ntlm_set_server_interface(struct ntlm_server_interface *iface)
++{
++    if (ns_interface != NULL)
++        return GSS_S_FAILURE;
++
++    ns_interface = iface;
++    return GSS_S_COMPLETE;
++}
++
+ /*
+  *
+  */
+@@ -41,13 +57,13 @@ OM_uint32
+ _gss_ntlm_allocate_ctx(OM_uint32 *minor_status, ntlm_ctx *ctx)
+ {
+     OM_uint32 maj_stat;
+-    struct ntlm_server_interface *ns_interface = NULL;
+-
++    if (ns_interface == NULL) {
+ #ifdef DIGEST
+-    ns_interface = &ntlmsspi_kdc_digest;
+-#endif
+-    if (ns_interface == NULL)
++	ns_interface = &ntlmsspi_kdc_digest;
++#else
+ 	return GSS_S_FAILURE;
++#endif
++    }
+ 
+     *ctx = calloc(1, sizeof(**ctx));
+     if (*ctx == NULL) {
+diff --git a/lib/gssapi/ntlm/init_sec_context.c b/lib/gssapi/ntlm/init_sec_context.c
+index be9c987c4..04329ec6b 100644
+--- a/lib/gssapi/ntlm/init_sec_context.c
++++ b/lib/gssapi/ntlm/init_sec_context.c
+@@ -33,6 +33,45 @@
+ 
+ #include "ntlm.h"
+ 
++/*
++ * Qumulo
++ */
++
++static const char *qumulo_NTLM_USER_FILE = NULL;
++static FILE *(*qumulo_fopen_NTLM_USER_FILE)(const char *) = NULL;
++
++static const char *
++getenv_NTLM_USER_FILE(void)
++{
++    if (qumulo_NTLM_USER_FILE != NULL) {
++        return qumulo_NTLM_USER_FILE;
++    }
++
++    return secure_getenv("NTLM_USER_FILE");
++}
++
++static FILE *
++fopen_NTLM_USER_FILE(const char *fname)
++{
++    if (qumulo_fopen_NTLM_USER_FILE != NULL) {
++        return qumulo_fopen_NTLM_USER_FILE(fname);
++    }
++
++    return fopen(fname, "r");
++}
++
++void
++heimdal_set_qumulo_NTLM_USER_FILE(const char *s)
++{
++    qumulo_NTLM_USER_FILE = s;
++}
++
++void
++heimdal_set_qumulo_fopen_NTLM_USER_FILE(void *f)
++{
++    qumulo_fopen_NTLM_USER_FILE = f;
++}
++
+ static int
+ from_file(const char *fn, const char *target_domain,
+           char **domainp, char **usernamep, struct ntlm_buf *key)
+@@ -42,7 +81,7 @@ from_file(const char *fn, const char *target_domain,
+ 
+     *domainp = NULL;
+ 
+-    f = fopen(fn, "r");
++    f = fopen_NTLM_USER_FILE(fn);
+     if (f == NULL)
+ 	return ENOENT;
+     rk_cloexec_file(f);
+@@ -97,7 +136,7 @@ get_user_file(const ntlm_name target_name,
+ 
+     domain = target_name != NULL ? target_name->domain : NULL;
+ 
+-    fn = secure_getenv("NTLM_USER_FILE");
++    fn = getenv_NTLM_USER_FILE();
+     if (fn == NULL)
+ 	return ENOENT;
+     if (from_file(fn, domain, domainp, usernamep, key) == 0)
+diff --git a/lib/gssapi/ntlm/kdc.c b/lib/gssapi/ntlm/kdc.c
+index 10aa2b980..745ae66cf 100644
+--- a/lib/gssapi/ntlm/kdc.c
++++ b/lib/gssapi/ntlm/kdc.c
+@@ -406,19 +406,6 @@ kdc_type3(OM_uint32 *minor_status,
+     return GSS_S_FAILURE;
+ }
+ 
+-/*
+- *
+- */
+-
+-static void
+-kdc_free_buffer(struct ntlm_buf *sessionkey)
+-{
+-    if (sessionkey->data)
+-	free(sessionkey->data);
+-    sessionkey->data = NULL;
+-    sessionkey->length = 0;
+-}
+-
+ /*
+  *
+  */
+@@ -429,7 +416,6 @@ struct ntlm_server_interface ntlmsspi_kdc_digest = {
+     kdc_probe,
+     kdc_type2,
+     kdc_type3,
+-    kdc_free_buffer
+ };
+ 
+ #endif /* DIGEST */
+diff --git a/lib/gssapi/ntlm/ntlm.h b/lib/gssapi/ntlm/ntlm.h
+index 7b16aa21d..389699223 100644
+--- a/lib/gssapi/ntlm/ntlm.h
++++ b/lib/gssapi/ntlm/ntlm.h
+@@ -61,36 +61,6 @@
+ #define HC_DEPRECATED_CRYPTO
+ #include "crypto-headers.h"
+ 
+-typedef OM_uint32
+-(*ntlm_interface_init)(OM_uint32 *, void **);
+-
+-typedef OM_uint32
+-(*ntlm_interface_destroy)(OM_uint32 *, void *);
+-
+-typedef int
+-(*ntlm_interface_probe)(OM_uint32 *, void *, const char *);
+-
+-typedef OM_uint32
+-(*ntlm_interface_type2)(OM_uint32 *, void *, uint32_t, const char *,
+-			const char *, uint32_t *, struct ntlm_buf *);
+-
+-typedef OM_uint32
+-(*ntlm_interface_type3)(OM_uint32 *, void *, const struct ntlm_type3 *,
+-			struct ntlm_buf *);
+-
+-typedef void
+-(*ntlm_interface_free_buffer)(struct ntlm_buf *);
+-
+-struct ntlm_server_interface {
+-    ntlm_interface_init nsi_init;
+-    ntlm_interface_destroy nsi_destroy;
+-    ntlm_interface_probe nsi_probe;
+-    ntlm_interface_type2 nsi_type2;
+-    ntlm_interface_type3 nsi_type3;
+-    ntlm_interface_free_buffer nsi_free_buffer;
+-};
+-
+-
+ struct ntlmv2_key {
+     uint32_t seq;
+     RC4_KEY sealkey;
+diff --git a/lib/gssapi/version-script.map b/lib/gssapi/version-script.map
+index 7f482b536..f9a24f20c 100644
+--- a/lib/gssapi/version-script.map
++++ b/lib/gssapi/version-script.map
+@@ -71,6 +71,7 @@ HEIMDAL_GSS_2.0 {
+ 		gss_krb5_set_allowable_enctypes;
+ 		gss_localname;
+ 		gss_mg_collect_error;
++		gss_ntlm_set_server_interface;
+ 		gss_oid_equal;
+ 		gss_oid_to_str;
+ 		gss_pname_to_uid;
+@@ -156,6 +157,7 @@ HEIMDAL_GSS_2.0 {
+ 		__gss_krb5_get_time_offset_x_oid_desc;
+ 		__gss_krb5_plugin_register_x_oid_desc;
+ 		__gss_ntlm_get_session_key_x_oid_desc;
++		__gss_c_inq_sspi_session_key_oid_desc;
+ 		__gss_c_nt_ntlm_oid_desc;
+ 		__gss_c_nt_dn_oid_desc;
+ 		__gss_krb5_nt_principal_name_referral_oid_desc;
+@@ -205,6 +207,10 @@ HEIMDAL_GSS_2.0 {
+ 		__gss_c_inq_negoex_key_oid_desc;
+ 		__gss_c_inq_negoex_verify_key_oid_desc;
+ 
++                # Qumulo
++                heimdal_set_qumulo_NTLM_USER_FILE;
++                heimdal_set_qumulo_fopen_NTLM_USER_FILE;
++		
+ 	local:
+ 		*;
+ };
+diff --git a/lib/krb5/keytab.c b/lib/krb5/keytab.c
+index bcb3ed837..581bcd75c 100644
+--- a/lib/krb5/keytab.c
++++ b/lib/krb5/keytab.c
+@@ -127,6 +127,27 @@ main (int argc, char **argv)
+  *
+  */
+ 
++/*
++ * Qumulo
++ */
++
++static const char *qumulo_KRB5_KTNAME = NULL;
++
++static const char *
++getenv_KRB5_KTNAME(void)
++{
++    if (qumulo_KRB5_KTNAME != NULL) {
++        return qumulo_KRB5_KTNAME;
++    }
++
++    return secure_getenv("KRB5_KTNAME");
++}
++
++void
++heimdal_set_qumulo_KRB5_KTNAME(const char *s)
++{
++    qumulo_KRB5_KTNAME = s;
++}
+ 
+ /**
+  * Register a new keytab backend.
+@@ -250,7 +271,7 @@ static const char *default_ktname(krb5_context context)
+ {
+     const char *tmp = NULL;
+ 
+-    tmp = secure_getenv("KRB5_KTNAME");
++    tmp = getenv_KRB5_KTNAME();
+     if(tmp != NULL)
+ 	return tmp;
+     return context->default_keytab;
+diff --git a/lib/krb5/time.c b/lib/krb5/time.c
+index d0d4af1a4..f6f53d917 100644
+--- a/lib/krb5/time.c
++++ b/lib/krb5/time.c
+@@ -33,6 +33,17 @@
+ 
+ #include "krb5_locl.h"
+ 
++static krb5_timestamp mock_time = 0;
++
++/**
++ * Set the mock clock value (used by Qumulo unit tests).
++ */
++KRB5_LIB_FUNCTION void KRB5_LIB_CALL
++krb5_set_mock_time(krb5_timestamp sec)
++{
++    mock_time = sec;
++}
++
+ /**
+  * Set the absolute time that the caller knows the kdc has so the
+  * kerberos library can calculate the relative diffrence beteen the
+@@ -83,7 +94,10 @@ KRB5_LIB_FUNCTION krb5_error_code KRB5_LIB_CALL
+ krb5_timeofday (krb5_context context,
+ 		krb5_timestamp *timeret)
+ {
+-    *timeret = time(NULL) + context->kdc_sec_offset;
++    if (mock_time)
++	*timeret = mock_time;
++    else
++	*timeret = time(NULL) + context->kdc_sec_offset;
+     return 0;
+ }
+ 
+@@ -96,12 +110,17 @@ krb5_us_timeofday (krb5_context context,
+ 		   krb5_timestamp *sec,
+ 		   int32_t *usec)
+ {
+-    struct timeval tv;
++    if (mock_time) {
++	*sec = mock_time;
++	*usec = 0;
++    } else {
++	struct timeval tv;
++	gettimeofday (&tv, NULL);
+ 
+-    gettimeofday (&tv, NULL);
++	*sec  = tv.tv_sec + context->kdc_sec_offset;
++	*usec = tv.tv_usec;		/* XXX */
++    }
+ 
+-    *sec  = tv.tv_sec + context->kdc_sec_offset;
+-    *usec = tv.tv_usec;		/* XXX */
+     return 0;
+ }
+ 
+diff --git a/lib/krb5/version-script.map b/lib/krb5/version-script.map
+index f6278e9ec..2b39d63a1 100644
+--- a/lib/krb5/version-script.map
++++ b/lib/krb5/version-script.map
+@@ -625,6 +625,7 @@ HEIMDAL_KRB5_2.0 {
+ 		krb5_set_password;
+ 		krb5_set_password_using_ccache;
+ 		krb5_set_real_time;
++               krb5_set_mock_time;
+ 		krb5_set_send_to_kdc_func;
+ 		krb5_set_use_admin_kdc;
+ 		krb5_set_warn_dest;
+@@ -881,6 +882,9 @@ HEIMDAL_KRB5_2.0 {
+                 _krb5_find_capath;
+                 _krb5_free_capath;
+ 
++                # Qumulo
++                heimdal_set_qumulo_KRB5_KTNAME;
++
+ 	local:
+ 		*;
+ };
+-- 
+2.53.0
+

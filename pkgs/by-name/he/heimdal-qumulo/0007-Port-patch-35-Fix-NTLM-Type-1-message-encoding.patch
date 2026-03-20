@@ -1,0 +1,60 @@
+From f4f76ab898d8da7a7e2d6dcbc698c4a72eb419cf Mon Sep 17 00:00:00 2001
+From: Philip Taron <philip@qumulo.com>
+Date: Thu, 19 Mar 2026 17:04:14 -0700
+Subject: [PATCH 7/7] Port patch 35: Fix NTLM Type 1 message encoding
+
+DomainName and WorkstationName in NTLM Type 1 messages are always
+encoded in OEM (not UCS-2), per MS-NLMP 2.2.1.1. The previous code
+incorrectly used UCS-2 when the UNICODE flag was set, causing
+"unsupported mechanism requested" errors for Windows client SMB
+session setups.
+---
+ lib/ntlm/ntlm.c | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/lib/ntlm/ntlm.c b/lib/ntlm/ntlm.c
+index 7384e1807..c804af378 100644
+--- a/lib/ntlm/ntlm.c
++++ b/lib/ntlm/ntlm.c
+@@ -670,7 +670,10 @@ heim_ntlm_decode_type1(const struct ntlm_buf *buf, struct ntlm_type1 *data)
+     uint32_t type;
+     struct sec_buffer domain, hostname;
+     krb5_storage *in;
+-    int ucs2;
++    // In the type1 message, domain and workstation are always sent in the OEM encoding, even
++    // if the peer indicates support for unicode in the message flags.
++    // See [MS-NLMP] 2.2.1.1
++    int ucs2 = 0;
+ 
+     memset(data, 0, sizeof(*data));
+ 
+@@ -687,8 +690,6 @@ heim_ntlm_decode_type1(const struct ntlm_buf *buf, struct ntlm_type1 *data)
+     CHECK(type, 1);
+     CHECK(krb5_ret_uint32(in, &data->flags), 0);
+ 
+-    ucs2 = !!(data->flags & NTLM_NEG_UNICODE);
+-
+     /*
+      * domain and hostname are unconditionally encoded regardless of
+      * NTLMSSP_NEGOTIATE_OEM_{HOSTNAME,WORKSTATION}_SUPPLIED flag
+@@ -735,14 +736,14 @@ heim_ntlm_encode_type1(const struct ntlm_type1 *type1, struct ntlm_buf *data)
+     struct sec_buffer domain, hostname;
+     krb5_storage *out;
+     uint32_t base, flags;
++    // In the type1 message, domain and workstation are always sent in the OEM encoding, even
++    // if the peer indicates support for unicode in the message flags.
++    // See [MS-NLMP] 2.2.1.1
+     int ucs2 = 0;
+ 
+     flags = type1->flags;
+     base = 16;
+ 
+-    if (flags & NTLM_NEG_UNICODE)
+-	ucs2 = 1;
+-
+     if (type1->domain) {
+ 	base += SIZE_SEC_BUFFER;
+ 	flags |= NTLM_OEM_SUPPLIED_DOMAIN;
+-- 
+2.53.0
+

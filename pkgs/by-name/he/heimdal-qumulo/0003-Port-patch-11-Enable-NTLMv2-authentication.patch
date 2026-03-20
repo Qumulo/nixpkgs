@@ -1,0 +1,93 @@
+From d31e206db27afb49785c16a9417b824517f85d17 Mon Sep 17 00:00:00 2001
+From: Philip Taron <philip@qumulo.com>
+Date: Thu, 19 Mar 2026 16:57:31 -0700
+Subject: [PATCH 3/7] Port patch 11: Enable NTLMv2 authentication
+
+Request Target Info from server (NTLM_NEG_TARGET flag), remove the
+"1 ||" that forced NTLMv1, use heim_ntlm_build_ntlm2_master for
+NTLMv2 key exchange, and remove the domain name verification that
+prevented cross-domain auth. Export heim_ntlm_build_ntlm2_master.
+---
+ lib/gssapi/ntlm/init_sec_context.c | 17 +++++++----------
+ lib/ntlm/libheimntlm-exports.def   |  1 +
+ lib/ntlm/version-script.map        |  1 +
+ 3 files changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/lib/gssapi/ntlm/init_sec_context.c b/lib/gssapi/ntlm/init_sec_context.c
+index 04329ec6b..7ecef8b5b 100644
+--- a/lib/gssapi/ntlm/init_sec_context.c
++++ b/lib/gssapi/ntlm/init_sec_context.c
+@@ -357,6 +357,8 @@ _gss_ntlm_init_sec_context
+ 	flags |= NTLM_NEG_NTLM;
+ 	flags |= NTLM_NEG_NTLM2_SESSION;
+ 	flags |= NTLM_NEG_KEYEX;
++	/* Request Target Info from the server, thus asking for NTLMv2. */
++	flags |= NTLM_NEG_TARGET;
+ 
+ 	memset(&type1, 0, sizeof(type1));
+ 
+@@ -411,7 +413,7 @@ _gss_ntlm_init_sec_context
+ 	 * NTLM Version 1 if no targetinfo buffer.
+ 	 */
+ 
+-	if (1 || type2.targetinfo.length == 0) {
++	if (type2.targetinfo.length == 0) {
+ 	    struct ntlm_buf sessionkey;
+ 
+ 	    if (type2.flags & NTLM_NEG_NTLM2_SESSION) {
+@@ -486,17 +488,11 @@ _gss_ntlm_init_sec_context
+ 		_gss_ntlm_delete_sec_context(minor_status,
+ 					     context_handle, NULL);
+ 		heim_ntlm_free_type2(&type2);
++		heim_ntlm_free_targetinfo(&ti);
+ 		*minor_status = ret;
+ 		return GSS_S_DEFECTIVE_TOKEN;
+ 	    }
+-
+-	    if (ti.domainname && strcmp(ti.domainname, name->domain) != 0) {
+-		_gss_ntlm_delete_sec_context(minor_status,
+-					     context_handle, NULL);
+-		heim_ntlm_free_type2(&type2);
+-		*minor_status = EINVAL;
+-		return GSS_S_FAILURE;
+-	    }
++	    heim_ntlm_free_targetinfo(&ti);
+ 
+ 	    ret = heim_ntlm_calculate_ntlm2(ctx->client->key.data,
+ 					    ctx->client->key.length,
+@@ -514,7 +510,8 @@ _gss_ntlm_init_sec_context
+ 		return GSS_S_FAILURE;
+ 	    }
+ 
+-	    ret = heim_ntlm_build_ntlm1_master(ntlmv2, sizeof(ntlmv2),
++	    ret = heim_ntlm_build_ntlm2_master(ntlmv2, sizeof(ntlmv2),
++					       &type3.ntlm,
+ 					       &sessionkey,
+ 					       &type3.sessionkey);
+ 	    memset_s(ntlmv2, sizeof(ntlmv2), 0, sizeof(ntlmv2));
+diff --git a/lib/ntlm/libheimntlm-exports.def b/lib/ntlm/libheimntlm-exports.def
+index 33ac09e70..aa05c1005 100644
+--- a/lib/ntlm/libheimntlm-exports.def
++++ b/lib/ntlm/libheimntlm-exports.def
+@@ -1,5 +1,6 @@
+ EXPORTS
+ 	heim_ntlm_build_ntlm1_master
++	heim_ntlm_build_ntlm2_master
+         heim_ntlm_calculate_lm2
+ 	heim_ntlm_calculate_ntlm1
+ 	heim_ntlm_calculate_ntlm2
+diff --git a/lib/ntlm/version-script.map b/lib/ntlm/version-script.map
+index 6fe67a618..4d9129e8d 100644
+--- a/lib/ntlm/version-script.map
++++ b/lib/ntlm/version-script.map
+@@ -3,6 +3,7 @@
+ HEIMDAL_NTLM_1.0 {
+ 	global:
+ 		heim_ntlm_build_ntlm1_master;
++		heim_ntlm_build_ntlm2_master;
+ 		heim_ntlm_calculate_lm2;
+ 		heim_ntlm_calculate_ntlm1;
+ 		heim_ntlm_calculate_ntlm2;
+-- 
+2.53.0
+
