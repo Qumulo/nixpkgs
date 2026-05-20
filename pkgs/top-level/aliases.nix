@@ -2628,7 +2628,6 @@ mapAliases {
   wlroots_0_18 = throw "'wlroots_0_18' has been removed in favor of newer versions"; # Added 2026-05-13
   wlx-overlay-s = throw "'wlx-overlay-s' and 'wayvr-dashboard' have been merged into a single application. Please switch to 'wayvr'"; # Added 2026-01-09
   wmii_hg = throw "'wmii_hg' has been renamed to/replaced by 'wmii'"; # Converted to throw 2025-10-27
-  wolfssl = throw "'wolfssl' has been removed because it has an unclear licensing situation and no remaining users in Nixpkgs"; # Added 2026-04-03
   woof = throw "'woof' has been removed as it is broken and unmaintained upstream"; # Added 2025-09-04
   wordpress_6_7 = throw "'wordpress_6_7' has been removed in favor of the new release, as it is unmaintained upstream"; # Added 2026-05-22
   worldengine-cli = throw "'worldengine-cli' has been removed because it has been marked as broken since at least November 2024."; # Added 2025-10-04
