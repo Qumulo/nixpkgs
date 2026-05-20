@@ -11,6 +11,7 @@
   e2fsprogs,
   fetchurl,
   glibc,
+  jq,
   kmod,
   linux,
   makeInitrd,
@@ -775,7 +776,8 @@ let
 
             export DEBIAN_FRONTEND=noninteractive
 
-            for component in "''${debsGrouped[@]}"; do
+            for groupIdx in $(${lib.getExe jq} -r '.debsGrouped | keys | join(" ")' "$NIX_ATTRS_JSON_FILE"); do
+              component=$(${lib.getExe jq} -r ".debsGrouped[$groupIdx] | join(\" \")" "$NIX_ATTRS_JSON_FILE")
               echo
               echo ">>> INSTALLING COMPONENT: $component"
               debs=
